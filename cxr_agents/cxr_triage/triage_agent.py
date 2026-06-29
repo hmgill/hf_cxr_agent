@@ -1,0 +1,142 @@
+# cxr-agent/agents/cxr_triage/triage_agent.py
+"""
+CXR Triage Agent
+================
+Standalone agent wrapper for the cxr_triage skill.
+
+Can be invoked directly for isolated triage runs (e.g. in testing or batch
+preprocessing pipelines), or called as a sub-agent by the orchestrator.
+
+Uses Claude claude-opus-4-6 via the LiteLLM extension for the Agents SDK.
+Tool implementation lives in tools/triage.py.
+Data classes are defined in models/pipeline.py — none are declared here.
+
+Usage:
+    python triage_agent.py path/to/cxr.jpg
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import os
+import sys
+from pathlib import Path
+
+from agents import Agent, Runner, function_tool
+from agents.extensions.models.litellm_model import LitellmModel
+
+from models.pipeline import TriageResult
+
+
+# ---------------------------------------------------------------------------
+# Tool
+# ---------------------------------------------------------------------------
+
+@function_tool
+async def triage_image(image_path: str) -> TriageResult:
+    """
+    Triage a medical image before CXR analysis.
+
+    Determines whether the image is a chest X-ray, its orientation
+    (PA / AP / lateral), and any quality issues that may affect downstream
+    analysis.
+
+    Args:
+        image_path: Absolute or relative path to the image file (JPEG or PNG).
+
+    Returns:
+        TriageResult with validity verdict, orientation, quality grade, and notes.
+    """
+    from tools.triage import run_triage
+    return await run_triage(image_path)
+
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+
+_SYSTEM_PROMPT = """
+You are the CXR Triage Agent. Your sole task is to validate a medical image
+before it enters the CXR analysis pipeline.
+
+Call `triage_image` with the provided image path, then report back:
+1. Whether the image is a chest X-ray
+2. The detected projection (PA / AP / lateral / oblique / unknown)
+3. Any quality issues detected
+4. The overall quality grade
+5. Your triage notes
+
+Be concise and use clinical language. Do not fabricate findings.
+""".strip()
+
+
+# ---------------------------------------------------------------------------
+# Agent factory
+# ---------------------------------------------------------------------------
+
+def build_triage_agent() -> Agent:
+    """Construct and return the CXR Triage agent."""
+    model = LitellmModel(
+        model="anthropic/claude-opus-4-6",
+        api_key=os.environ["ANTHROPIC_API_KEY"],
+    )
+
+    return Agent(
+        name="CXR Triage Agent",
+        model=model,
+        instructions=_SYSTEM_PROMPT,
+        tools=[triage_image],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
+
+async def run_triage_agent(image_path: str) -> TriageResult:
+    """
+    Run the triage agent on a single image.
+
+    Args:
+        image_path: Path to the image file.
+
+    Returns:
+        TriageResult from the triage tool call.
+    """
+    agent = build_triage_agent()
+
+    path = Path(image_path)
+    media_type_map = {
+        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".png": "image/png", ".webp": "image/webp",
+    }
+    media_type = media_type_map.get(path.suffix.lower(), "image/jpeg")
+    b64 = base64.b64encode(path.read_bytes()).decode("utf-8")
+
+    input_message = [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": b64},
+        },
+        {"type": "text", "text": "Please triage this image."},
+    ]
+
+    result = await Runner.run(agent, input=input_message)
+    return result.final_output
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: triage_agent.py <image_path>", file=sys.stderr)
+        sys.exit(1)
+
+    result = asyncio.run(run_triage_agent(sys.argv[1]))
+    if isinstance(result, TriageResult):
+        print(result.model_dump_json(indent=2))
+    else:
+        print(result)

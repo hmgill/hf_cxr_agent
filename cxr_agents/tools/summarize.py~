@@ -1,0 +1,142 @@
+# cxr-agent/tools/summarize.py
+"""
+CXR Summary Tool
+================
+Distils the free-text reasoning output from NV-Reason-CXR-3B into a structured
+FindingsSummary: a normal/abnormal verdict, a salience-ranked list of findings,
+and a concise plain-language summary.
+
+Uses a Claude model directly via the Anthropic SDK (default: claude-sonnet-4-6,
+overridable via CXR_SUMMARY_MODEL). This is a text parse/rank task — it does
+not see the image.
+
+Data classes are defined in models/pipeline.py — none are declared here.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+
+import anthropic
+
+from models.pipeline import FindingsSummary
+
+
+DEFAULT_SUMMARY_MODEL = "claude-sonnet-4-6"
+
+
+SUMMARY_SYSTEM_PROMPT = """\
+You are a radiology summarisation assistant. You are given the free-text \
+findings produced by a chest X-ray reasoning model, and optionally that \
+model's internal reasoning trace. Distil them into a structured summary.
+
+Respond with ONLY a valid JSON object — no markdown fences, no preamble, no \
+text outside the JSON.
+
+Rules:
+- Base every finding strictly on the provided FINDINGS text. Do not invent \
+findings. The reasoning trace, if present, is only to help you judge which \
+findings are most clinically salient — never extract findings that are not \
+supported by the FINDINGS text.
+- If the findings describe a normal/unremarkable study (e.g. "No Finding", \
+"no acute cardiopulmonary process"), set is_normal=true and \
+salient_findings={}.
+- Otherwise set is_normal=false and populate salient_findings as a mapping of \
+anatomical location -> finding, e.g. {"right lung": "fluid"}. Order the \
+entries most-to-least clinically salient. Use one entry per location; if a \
+region has several findings, record the single most salient one. Use the \
+location stated in the findings, or "unspecified" if none is given.
+- summary: 1-3 plain-language sentences capturing the clinical bottom line.
+
+Respond with exactly this JSON structure:
+{
+  "is_normal": <bool>,
+  "salient_findings": {"<location>": "<finding>"},
+  "summary": "<string>"
+}
+"""
+
+
+async def run_summarize(
+    findings_text: str,
+    reasoning_trace: str = "",
+    model: str | None = None,
+) -> FindingsSummary:
+    """
+    Summarise CXR reasoning output into a structured FindingsSummary.
+
+    Args:
+        findings_text: The free-text `answer` from the reasoning model.
+        reasoning_trace: Optional chain-of-thought, used only to rank salience.
+        model: Override model identifier. Defaults to CXR_SUMMARY_MODEL env var
+               or claude-sonnet-4-6.
+
+    Returns:
+        FindingsSummary with is_normal, salient_findings, summary, source_model.
+
+    Raises:
+        ValueError: If the model returns malformed JSON.
+    """
+    model = model or os.environ.get("CXR_SUMMARY_MODEL", DEFAULT_SUMMARY_MODEL)
+
+    user_text = f"FINDINGS:\n{findings_text.strip() or '(none provided)'}"
+    if reasoning_trace.strip():
+        user_text += (
+            f"\n\nMODEL REASONING (for salience ranking only — not a source of "
+            f"new findings):\n{reasoning_trace.strip()}"
+        )
+
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    message = client.messages.create(
+        model=model,
+        max_tokens=1024,
+        system=SUMMARY_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_text}],
+    )
+
+    raw_text = message.content[0].text.strip()
+
+    # Strip accidental markdown fences (defensive)
+    if raw_text.startswith("```"):
+        raw_text = "\n".join(
+            line for line in raw_text.splitlines()
+            if not line.startswith("```")
+        ).strip()
+
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Summary model returned non-JSON response: {raw_text!r}"
+        ) from exc
+
+    data.setdefault("source_model", model)
+    return FindingsSummary(**data)
+
+
+# ---------------------------------------------------------------------------
+# Sync wrapper + CLI
+# ---------------------------------------------------------------------------
+
+def run_summarize_sync(findings_text: str, reasoning_trace: str = "") -> FindingsSummary:
+    """Synchronous wrapper around run_summarize."""
+    import asyncio
+    return asyncio.run(run_summarize(findings_text, reasoning_trace))
+
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(description="CXR Summary — distil findings text")
+    parser.add_argument("findings", help="Free-text findings, or '-' to read stdin")
+    args = parser.parse_args()
+
+    text = sys.stdin.read() if args.findings == "-" else args.findings
+    try:
+        result = run_summarize_sync(text)
+        print(result.model_dump_json(indent=2))
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(2)

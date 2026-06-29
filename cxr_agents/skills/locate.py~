@@ -1,0 +1,165 @@
+# cxr-agent/tools/locate.py
+"""
+CXR Localization Tool
+=====================
+Grounds the orchestrator's salient findings onto the image using the
+NV-Locate-Anything-3B model, accessed through its FastMCP endpoint.
+
+Called programmatically with the SDK's MCP client (MCPServerStreamableHttp) —
+NOT registered via the agent's mcp_servers=[...], because the locate tools take
+the image as base64 and the LLM must never emit that as an argument.
+
+Per the endpoint's MCP contract, the ORIGINAL (un-resized) image is sent; the
+server resizes internally and returns boxes already in original pixel space.
+
+Data classes are defined in models/pipeline.py — none are declared here.
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+import json
+import sys
+from pathlib import Path
+
+from PIL import Image
+
+from models.pipeline import BoundingBox, LocalizationResult, LocalizedRegion
+
+LOCATE_MCP_URL = "https://nv-locate-anything-3b.fastmcp.app/mcp"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _load_image_b64(image_path: str) -> tuple[str, str]:
+    """Return (base64 JPEG of the ORIGINAL image, image_id). No client resize."""
+    path = Path(image_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+    img = Image.open(path).convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=92)
+    return base64.b64encode(buf.getvalue()).decode("ascii"), path.stem
+
+
+def _parse_targets(targets_json) -> tuple[list[str], dict[str, str]]:
+    """
+    Parse the orchestrator's targets into (locations, location->finding map).
+
+    Accepts the salient_findings mapping {location: finding} (the normal case),
+    a bare list of location strings, or a JSON string of either.
+    """
+    obj = targets_json
+    if isinstance(obj, str):
+        try:
+            obj = json.loads(obj)
+        except json.JSONDecodeError:
+            return [], {}
+
+    if isinstance(obj, dict):
+        locations = [str(k) for k in obj.keys()]
+        finding_for = {str(k): str(v) for k, v in obj.items()}
+        return locations, finding_for
+    if isinstance(obj, list):
+        return [str(x) for x in obj], {}
+    return [], {}
+
+
+# ---------------------------------------------------------------------------
+# Core localization
+# ---------------------------------------------------------------------------
+
+async def run_localization(
+    image_path: str,
+    targets_json: str,
+    generation_mode: str = "hybrid",
+) -> LocalizationResult:
+    """
+    Localize the target anatomical regions on the CXR with NV-Locate-Anything-3B.
+
+    Args:
+        image_path: Path to the CXR image (sent at original resolution).
+        targets_json: salient_findings location->finding map (JSON string),
+                      e.g. '{"right lower lung": "round opacity"}'. The location
+                      KEYS are used as detection categories.
+        generation_mode: "hybrid" (default), "fast", or "slow".
+
+    Returns:
+        LocalizationResult with one region per returned box (bbox in original
+        pixel space; finding = the mapped finding text for that location).
+    """
+    locations, finding_for = _parse_targets(targets_json)
+    if not locations:
+        return LocalizationResult(regions=[], annotated_image_path=None)
+
+    image_b64, image_id = _load_image_b64(image_path)
+
+    try:
+        from agents.mcp import MCPServerStreamableHttp
+    except ImportError:
+        print("LOCALIZATION ERROR: agents.mcp unavailable", file=sys.stderr, flush=True)
+        return LocalizationResult(regions=[], annotated_image_path=None)
+
+    try:
+        async with MCPServerStreamableHttp(
+            name="cxr-localization",
+            params={"url": LOCATE_MCP_URL},
+            client_session_timeout_seconds=300,
+        ) as server:
+            res = await server.call_tool(
+                "locate_objects",
+                {
+                    "image_b64": image_b64,
+                    "image_id": image_id,
+                    "categories": locations,
+                    "generation_mode": generation_mode,
+                    "max_new_tokens": 2048,
+                },
+            )
+    except Exception as e:
+        import traceback
+        print(f"LOCALIZATION ERROR: {traceback.format_exc()}", file=sys.stderr, flush=True)
+        return LocalizationResult(regions=[], annotated_image_path=None)
+
+    content = getattr(res, "content", None)
+    raw = getattr(content[0], "text", "") if content else ""
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return LocalizationResult(regions=[], annotated_image_path=None)
+
+    if data.get("success") is False:
+        print(f"LOCALIZATION: server reported failure: {data.get('error') or data.get('reason')}",
+              file=sys.stderr, flush=True)
+        return LocalizationResult(regions=[], annotated_image_path=None)
+
+    boxes = data.get("boxes") or []
+    cats = data.get("categories") or locations
+
+    regions: list[LocalizedRegion] = []
+    for i, b in enumerate(boxes):
+        try:
+            x1, y1 = float(b["x1"]), float(b["y1"])
+            x2, y2 = float(b["x2"]), float(b["y2"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        label = str(cats[i % len(cats)]) if cats else ""
+        bbox = BoundingBox(
+            x=int(round(x1)),
+            y=int(round(y1)),
+            w=int(round(x2 - x1)),
+            h=int(round(y2 - y1)),
+        )
+        # NV-Locate does not return a per-box confidence; use 1.0 as a placeholder.
+        regions.append(
+            LocalizedRegion(
+                finding=finding_for.get(label, label),
+                bbox=bbox,
+                score=1.0,
+            )
+        )
+
+    return LocalizationResult(regions=regions, annotated_image_path=None)

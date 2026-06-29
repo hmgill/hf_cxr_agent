@@ -1,0 +1,183 @@
+# cxr-agent/agents/registry.py
+"""
+AgentSkills Registry
+====================
+Discovers all skills in the skills/ directory and generates an XML catalog
+for injection into agent system prompts.
+
+Implements the AgentSkills.io progressive disclosure pattern:
+  Tier 1 (catalog):   name + description for every skill — injected at startup
+  Tier 2 (body):      full SKILL.md body — loaded on demand by the agent
+  Tier 3 (resources): tools / references / assets — loaded on demand
+
+No data classes or agent logic here — discovery and catalog generation only.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Skill metadata record
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SkillMeta:
+    """Lightweight record for a discovered skill's frontmatter and location."""
+
+    name: str
+    description: str
+    location: Path
+    compatibility: str = ""
+    metadata: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def skill_dir(self) -> Path:
+        return self.location.parent
+
+    def load_body(self) -> str:
+        """Load the SKILL.md body (everything after the closing frontmatter ---)."""
+        content = self.location.read_text(encoding="utf-8")
+        parts = content.split("---", 2)
+        return parts[2].strip() if len(parts) >= 3 else content.strip()
+
+    def list_resources(self) -> list[Path]:
+        """Return skill references and assets (markdown and JSON only)."""
+        resources: list[Path] = []
+        for subdir in ("references", "assets"):
+            d = self.skill_dir / subdir
+            if d.exists():
+                resources.extend(
+                    p for p in sorted(d.iterdir())
+                    if p.suffix in (".md", ".json")
+                )
+        return resources
+
+# ---------------------------------------------------------------------------
+# Frontmatter parser
+# ---------------------------------------------------------------------------
+
+def _parse_frontmatter(content: str) -> dict[str, str]:
+    """
+    Extract key-value pairs from YAML frontmatter. Lenient by design so skills
+    authored for other clients (with minor YAML quirks) still load correctly.
+    """
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return {}
+
+    result: dict[str, str] = {}
+    current_key: str | None = None
+    multiline_buf: list[str] = []
+
+    for line in parts[1].splitlines():
+        kv = re.match(r'^([a-zA-Z_][a-zA-Z0-9_-]*)\s*:\s*(.*)', line)
+        if kv:
+            if current_key and multiline_buf:
+                result[current_key] = " ".join(multiline_buf).strip()
+                multiline_buf = []
+            current_key = kv.group(1)
+            val = kv.group(2).strip()
+            if val == ">":
+                multiline_buf = []
+            elif val:
+                result[current_key] = val
+                current_key = None
+        elif current_key and line.startswith("  "):
+            multiline_buf.append(line.strip())
+
+    if current_key and multiline_buf:
+        result[current_key] = " ".join(multiline_buf).strip()
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+
+class SkillRegistry:
+    """Discovers and indexes all AgentSkills.io-compliant skills under skills_root."""
+
+    def __init__(self, skills_root: Path | str | None = None) -> None:
+        if skills_root is None:
+            skills_root = Path(__file__).parent.parent / "skills"
+        self.skills_root = Path(skills_root)
+        self._skills: dict[str, SkillMeta] = {}
+        self._discover()
+
+    def _discover(self) -> None:
+        """Scan skills_root for SKILL.md files and populate the index."""
+        if not self.skills_root.exists():
+            return
+        for skill_dir in sorted(self.skills_root.iterdir()):
+            skill_md = skill_dir / "SKILL.md"
+            if not skill_md.exists():
+                continue
+            fm = _parse_frontmatter(skill_md.read_text(encoding="utf-8"))
+            name = fm.get("name", skill_dir.name)
+            description = fm.get("description", "")
+            if not description:
+                continue
+            self._skills[name] = SkillMeta(
+                name=name,
+                description=description,
+                location=skill_md,
+                compatibility=fm.get("compatibility", ""),
+                metadata={
+                    k: v for k, v in fm.items()
+                    if k not in ("name", "description", "license",
+                                 "compatibility", "allowed-tools")
+                },
+            )
+
+    def get(self, name: str) -> SkillMeta | None:
+        return self._skills.get(name)
+
+    def all_skills(self) -> list[SkillMeta]:
+        return list(self._skills.values())
+
+    def generate_catalog_xml(self) -> str:
+        """Generate an XML skills catalog for injection into a system prompt."""
+        lines = ["<available_skills>"]
+        for skill in self.all_skills():
+            lines.append("  <skill>")
+            lines.append(f"    <name>{skill.name}</name>")
+            lines.append(f"    <description>{skill.description}</description>")
+            lines.append(f"    <location>{skill.location}</location>")
+            resources = skill.list_resources()
+            if resources:
+                lines.append("    <skill_resources>")
+                for r in resources:
+                    lines.append(f"      <file>{r}</file>")
+                lines.append("    </skill_resources>")
+            lines.append("  </skill>")
+        lines.append("</available_skills>")
+        return "\n".join(lines)
+
+    def generate_catalog_markdown(self) -> str:
+        """Generate a Markdown skills catalog (alternative to XML)."""
+        lines = ["## Available Skills\n"]
+        for skill in self.all_skills():
+            lines.append(f"### `{skill.name}`")
+            lines.append(f"{skill.description}\n")
+            lines.append(f"Location: `{skill.location}`\n")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Convenience singleton
+# ---------------------------------------------------------------------------
+
+_default_registry: SkillRegistry | None = None
+
+
+def get_registry() -> SkillRegistry:
+    """Return (or lazily create) the default project-level registry."""
+    global _default_registry
+    if _default_registry is None:
+        _default_registry = SkillRegistry()
+    return _default_registry

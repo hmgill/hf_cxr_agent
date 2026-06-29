@@ -1,0 +1,184 @@
+# cxr-agent/tools/report.py
+"""
+CXR Report Persistence
+======================
+Writes a completed CXRAnalysisResult to disk as:
+  - a JSON file  — full structured record (machine-readable; the parse target
+                   for downstream agents)
+  - a Markdown file — human-readable rendering (optional)
+
+Files are named "<stem>_<UTC timestamp>.<ext>" so repeated runs on the same
+image never overwrite each other.
+
+Data classes are defined in models/pipeline.py — none are declared here.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+
+from models.pipeline import CXRAnalysisResult
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def render_markdown(result: CXRAnalysisResult, image_path: str | None = None) -> str:
+    """Render a CXRAnalysisResult as a readable Markdown report."""
+    t = result.triage
+    lines: list[str] = ["# CXR Analysis Report", ""]
+    if image_path:
+        lines += [f"**Image:** `{image_path}`"]
+    lines += [f"**Generated:** {datetime.now(timezone.utc).isoformat()}", ""]
+
+    # --- Triage ---
+    lines += ["## Triage", ""]
+    lines += [
+        f"- Chest X-ray: {t.is_chest_xray}",
+        f"- Orientation: {t.orientation}",
+        f"- Quality grade: {t.quality_grade}",
+        f"- Quality issues: {', '.join(t.quality_issues) if t.quality_issues else 'none'}",
+        f"- Valid: {t.valid}",
+        "",
+        f"> {t.triage_notes}",
+        "",
+    ]
+
+    # --- Summary (executive view, derived from reasoning) ---
+    lines += ["## Summary", ""]
+    s = result.summary
+    if s is None:
+        lines += ["_No summary produced._", ""]
+    else:
+        verdict = "Normal study" if s.is_normal else "Abnormal study"
+        lines += [f"**Verdict:** {verdict}", "", s.summary, ""]
+        if s.salient_findings:
+            lines += ["| Location | Findings |", "|---|---|"]
+            for location, findings in s.salient_findings.items():
+                joined = "; ".join(findings) if isinstance(findings, list) else str(findings)
+                lines.append(f"| {location} | {joined} |")
+            lines.append("")
+        if s.source_model:
+            lines += [f"_Summary model: {s.source_model}_", ""]
+
+    # --- Reasoning (detail) ---
+    lines += ["## Reasoning (detail)", ""]
+    r = result.reasoning
+    if r is None:
+        lines += ["_No reasoning output (triage failed or pipeline stopped early)._", ""]
+    else:
+        lines += [f"**Impression:** {r.impression}", ""]
+        if r.findings:
+            lines += [
+                "| Finding | Severity | Location | Confidence |",
+                "|---|---|---|---|",
+            ]
+            for f in r.findings:
+                lines.append(
+                    f"| {f.label} | {f.severity} | {f.location} | {f.confidence:.2f} |"
+                )
+            lines.append("")
+
+        # Chain-of-thought — retained for analysis, collapsed and clearly
+        # labelled so it is not treated as a clinical statement.
+        if r.thinking:
+            lines += [
+                "<details>",
+                "<summary>Model reasoning (chain-of-thought — not for clinical display)</summary>",
+                "",
+                "```",
+                r.thinking,
+                "```",
+                "",
+                "</details>",
+                "",
+            ]
+
+    # --- Localization ---
+    lines += ["## Localization", ""]
+    loc = result.localization
+    if loc and loc.regions:
+        lines += ["| Finding | Box (x, y, w, h) | Score |", "|---|---|---|"]
+        for reg in loc.regions:
+            b = reg.bbox
+            lines.append(
+                f"| {reg.finding} | ({b.x}, {b.y}, {b.w}, {b.h}) | {reg.score:.2f} |"
+            )
+        lines.append("")
+        if loc.annotated_image_path:
+            lines += [f"Annotated overlay: `{loc.annotated_image_path}`", ""]
+    else:
+        lines += ["_No localized regions._", ""]
+
+    # --- Run metadata ---
+    m = result.pipeline_meta
+    lines += ["## Run metadata", ""]
+    lines += [
+        f"- Model: {m.model}",
+        f"- Latency: {m.latency_ms} ms",
+        f"- Tokens used: {m.tokens_used}",
+        f"- Errors: {', '.join(m.errors) if m.errors else 'none'}",
+        "",
+    ]
+
+    if result.voice_audio_path:
+        lines += [f"**Audio:** `{result.voice_audio_path}`", ""]
+
+    return "\n".join(lines)
+
+
+def save_report(
+    result: CXRAnalysisResult,
+    image_path: str | None = None,
+    out_dir: str | Path = "reports",
+    base_name: str | None = None,
+    write_markdown: bool = True,
+) -> dict[str, Path]:
+    """
+    Write the analysis result to disk.
+
+    Args:
+        result: The completed CXRAnalysisResult.
+        image_path: Source image path — used to derive the filename stem.
+        out_dir: Directory to write into (created if absent).
+        base_name: Override for the filename stem. Defaults to the image stem.
+        write_markdown: Also write a human-readable Markdown report.
+
+    Returns:
+        Dict mapping artifact kind ("json", "markdown") to its written Path.
+    """
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    stem = base_name or (Path(image_path).stem if image_path else "cxr_report")
+    name = f"{stem}_{_utc_timestamp()}"
+
+    paths: dict[str, Path] = {}
+
+    # Annotated overlay — drawn BEFORE the JSON so its path is recorded in it.
+    # Boxes are scaled from the server's coordinate frame onto the original
+    # image inside draw_localization_overlay (resize-aware).
+    if image_path and result.localization and result.localization.regions:
+        try:
+            from tools.overlay import draw_localization_overlay
+            overlay_path = out / f"{name}_overlay.png"
+            drawn = draw_localization_overlay(image_path, result.localization, overlay_path)
+            if drawn:
+                result.localization.annotated_image_path = drawn
+                paths["overlay"] = Path(drawn)
+        except Exception as e:
+            import sys
+            print(f"OVERLAY ERROR: {type(e).__name__}: {e}", file=sys.stderr)
+
+    json_path = out / f"{name}.json"
+    json_path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+    paths["json"] = json_path
+
+    if write_markdown:
+        md_path = out / f"{name}.md"
+        md_path.write_text(render_markdown(result, image_path), encoding="utf-8")
+        paths["markdown"] = md_path
+
+    return paths
