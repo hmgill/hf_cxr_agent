@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cxr-agent"
+version = "0.1.0"
+description = "Multi-skill CXR analysis agent using OpenAI Agents SDK + Claude"
+requires-python = ">=3.11"
+dependencies = [
+    # Agent framework — >=0.17 brings the agents.sandbox module (SandboxAgent,
+    # UnixLocalSandboxClient, Manifest) used by the cxr-overlay sandbox skill.
+    "openai-agents[litellm]>=0.17",
+    # Anthropic SDK (for direct triage calls)
+    "anthropic>=0.45.0",
+    # Data modelling
+    "pydantic>=2.7.0",
+    # Image handling
+    "pillow>=10.0.0",
+    # Async utilities
+    "anyio>=4.0.0",
+]
+
+[project.optional-dependencies]
+voice = [
+    "elevenlabs>=1.0.0",
+    "openai>=1.30.0",       # for Whisper STT
+    "sounddevice>=0.4.6",
+    "numpy>=1.26.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.4.0",
+    "mypy>=1.10.0",
+]
+
+[project.scripts]
+cxr-agent = "main:main"
+
+[tool.project.notes]
+# agents/  — one subdirectory per agent; each contains the agent module
+# skills/  — one subdirectory per skill; tools/ replaces the old scripts/
+# models/  — all shared Pydantic data classes (pipeline.py)
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true

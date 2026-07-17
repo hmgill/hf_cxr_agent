@@ -1,0 +1,26 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# Editor / backup files
+*~
+*.swp
+*.bak
+
+# Environments & secrets
+.venv/
+venv/
+.env
+.env.*
+
+# Logs & local outputs
+*.log
+cxr_agent.log
+
+# Chainlit runtime artifacts (keep .chainlit/config.toml; ignore generated state)
+.chainlit/.files/
+.chainlit/translations/
+.files/
+
+# OS noise
+.DS_Store

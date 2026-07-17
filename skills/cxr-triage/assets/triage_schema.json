@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TriageResult",
+  "description": "Output schema for the CXR triage skill.",
+  "type": "object",
+  "required": ["valid", "is_chest_xray", "orientation", "quality_issues", "quality_grade", "triage_notes"],
+  "additionalProperties": false,
+  "properties": {
+    "valid": {
+      "type": "boolean",
+      "description": "True if the image is a usable chest X-ray (is_chest_xray=true AND quality_grade != non_diagnostic)."
+    },
+    "is_chest_xray": {
+      "type": "boolean",
+      "description": "True if the image is any kind of chest radiograph."
+    },
+    "orientation": {
+      "type": "string",
+      "enum": ["PA", "AP", "lateral", "oblique", "unknown", "not_applicable"],
+      "description": "Detected CXR projection."
+    },
+    "quality_issues": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "rotation",
+          "low_exposure",
+          "overexposure",
+          "motion_blur",
+          "clipping",
+          "foreign_object",
+          "poor_inspiration",
+          "artefact"
+        ]
+      },
+      "description": "List of detected quality issue tags."
+    },
+    "quality_grade": {
+      "type": "string",
+      "enum": ["acceptable", "suboptimal", "non_diagnostic"],
+      "description": "Overall quality tier for the image."
+    },
+    "triage_notes": {
+      "type": "string",
+      "description": "Radiologist-style explanation of the triage decision."
+    }
+  }
+}

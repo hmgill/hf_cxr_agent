@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CXR finding overlay — __IMAGE_ID__</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0d1117; color: #e6edf3;
+         font: 14px/1.5 -apple-system, system-ui, Segoe UI, Roboto, sans-serif; }
+  header { padding: 14px 18px; border-bottom: 1px solid #21262d; }
+  header h1 { margin: 0; font-size: 15px; font-weight: 600; }
+  header .meta { color: #8b949e; font-size: 12px; margin-top: 2px; }
+  .wrap { display: flex; gap: 18px; padding: 18px; flex-wrap: wrap; }
+  .stage { position: relative; line-height: 0; background: #000;
+           border: 1px solid #21262d; border-radius: 8px; overflow: hidden;
+           max-width: 100%; align-self: flex-start; }
+  .stage img { display: block; max-width: 100%; height: auto; }
+  .stage svg, .stage .labels { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .labels { pointer-events: none; }
+  .chip { position: absolute; transform: translateY(-100%);
+          background: rgba(0,0,0,.62); color: #fff; font: 600 12px/1.4 system-ui, sans-serif;
+          padding: 1px 6px; border-radius: 4px 4px 4px 0; white-space: nowrap;
+          border-left: 3px solid #fff; }
+  .chip.below { transform: translateY(0); border-radius: 0 4px 4px 4px; }
+  .panel { min-width: 260px; max-width: 340px; flex: 1; }
+  .panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em;
+              color: #8b949e; margin: 0 0 8px; }
+  .ctl { margin-bottom: 14px; }
+  .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3px;
+            margin-right: 8px; vertical-align: -1px; border: 1px solid #00000055; }
+  label.row { display: flex; align-items: center; gap: 6px; padding: 4px 0; cursor: pointer; }
+  label.row .name { flex: 1; }
+  label.row .pct { color: #8b949e; font-variant-numeric: tabular-nums; font-size: 12px; }
+  input[type=range] { width: 100%; }
+  .legend-key { display: flex; gap: 14px; flex-wrap: wrap; margin: 2px 0 0; }
+  .legend-key span.k { color: #8b949e; font-size: 12px; }
+  .impression { margin-top: 4px; color: #c9d1d9; font-size: 13px;
+                background: #161b22; border: 1px solid #21262d; border-radius: 8px;
+                padding: 10px 12px; line-height: 1.45; }
+  .empty { color: #8b949e; font-size: 12px; }
+  .disclaimer { color: #8b949e; font-size: 11px; margin-top: 12px;
+                border-top: 1px solid #21262d; padding-top: 10px; }
+  button.mini { background: #21262d; color: #e6edf3; border: 1px solid #30363d;
+                border-radius: 6px; padding: 4px 8px; font-size: 12px; cursor: pointer; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CXR finding overlay</h1>
+  <div class="meta">image: __IMAGE_ID__ · __N_REGIONS__ localized finding(s) · NV-Locate-Anything-3B</div>
+</header>
+<div class="wrap">
+  <div class="stage">
+    <img id="cxr" src="data:__MEDIA_TYPE__;base64,__CXR_B64__" alt="chest X-ray" />
+    <svg id="ov" xmlns="http://www.w3.org/2000/svg"></svg>
+    <div class="labels" id="labels"></div>
+  </div>
+  <div class="panel">
+    <div class="ctl">
+      <h2>Box fill opacity</h2>
+      <input id="opacity" type="range" min="0" max="100" value="22" />
+    </div>
+    <div class="ctl">
+      <h2>Findings <button class="mini" id="toggleAll">toggle all</button></h2>
+      <div id="legend"></div>
+    </div>
+    <div class="ctl">
+      <h2>Severity</h2>
+      <div class="legend-key" id="sevkey"></div>
+    </div>
+    <div class="ctl">
+      <h2>Impression</h2>
+      <div class="impression" id="impression">__IMPRESSION__</div>
+    </div>
+    <div class="disclaimer">
+      Decision support only — not a diagnosis. Boxes reflect the localization
+      model's output and may be imprecise; confirm with a qualified radiologist.
+    </div>
+  </div>
+</div>
+<script>
+const REGIONS = __REGIONS_JSON__;   // [{finding,x,y,w,h,score,severity,location,confidence}], x/y/w/h in [0,1]
+const LUT     = __LUT_JSON__;       // {names:[...], colors:{sev:[r,g,b]}, default:[r,g,b]}
+let IMG_W = __IMG_W__ || 0, IMG_H = __IMG_H__ || 0;
+
+const svg = document.getElementById("ov");
+const labels = document.getElementById("labels");
+const SVGNS = "http://www.w3.org/2000/svg";
+const visible = REGIONS.map(() => true);
+let opacity = 0.22;
+
+// Uniform-scale viewBox when we know the pixel size (keeps strokes/boxes crisp
+// without distortion); fall back to a unit square stretched to the frame.
+if (IMG_W > 0 && IMG_H > 0) {
+  svg.setAttribute("viewBox", `0 0 ${IMG_W} ${IMG_H}`);
+  svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
+} else {
+  IMG_W = 1000; IMG_H = 1000;
+  svg.setAttribute("viewBox", "0 0 1000 1000");
+  svg.setAttribute("preserveAspectRatio", "none");
+}
+
+function colorFor(sev) {
+  const c = (LUT.colors && LUT.colors[sev]) || LUT.default || [128, 148, 168];
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
+}
+function pctLabel(r) {
+  const v = (r.score != null) ? r.score : r.confidence;
+  return (v != null && !isNaN(v)) ? `${Math.round(v * 100)}%` : "";
+}
+
+function draw() {
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  labels.innerHTML = "";
+  REGIONS.forEach((r, i) => {
+    if (!visible[i]) return;
+    const col = colorFor(r.severity);
+    // Boxes in pixel space (normalized × image pixels) — scaled uniformly by the SVG.
+    const rect = document.createElementNS(SVGNS, "rect");
+    rect.setAttribute("x", r.x * IMG_W); rect.setAttribute("y", r.y * IMG_H);
+    rect.setAttribute("width", r.w * IMG_W); rect.setAttribute("height", r.h * IMG_H);
+    rect.setAttribute("fill", col);
+    rect.setAttribute("fill-opacity", opacity);
+    rect.setAttribute("stroke", col);
+    rect.setAttribute("stroke-width", 2.5);
+    rect.setAttribute("vector-effect", "non-scaling-stroke");
+    svg.appendChild(rect);
+
+    // Fixed-size HTML label chip positioned in % of the frame (crisp at any zoom).
+    const pct = pctLabel(r);
+    const chip = document.createElement("div");
+    chip.className = "chip" + (r.y < 0.05 ? " below" : "");
+    chip.style.left = (r.x * 100) + "%";
+    chip.style.top = (r.y * 100) + "%";
+    chip.style.borderLeftColor = col;
+    chip.textContent = pct ? `${r.finding} · ${pct}` : r.finding;
+    labels.appendChild(chip);
+  });
+}
+
+// Per-finding legend with toggles.
+const legend = document.getElementById("legend");
+if (REGIONS.length === 0) {
+  legend.innerHTML = '<div class="empty">No localized regions to show. ' +
+    'The model returned no bounding boxes for this image.</div>';
+} else {
+  REGIONS.forEach((r, i) => {
+    const row = document.createElement("label"); row.className = "row";
+    const cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = true;
+    cb.onchange = () => { visible[i] = cb.checked; draw(); };
+    const sw = document.createElement("span"); sw.className = "swatch";
+    sw.style.background = colorFor(r.severity);
+    const nm = document.createElement("span"); nm.className = "name";
+    nm.textContent = r.location ? `${r.finding} (${r.location})` : r.finding;
+    const pct = document.createElement("span"); pct.className = "pct";
+    pct.textContent = pctLabel(r);
+    row.append(cb, sw, nm, pct); legend.append(row);
+  });
+}
+
+// Severity key (only the severities actually present).
+const sevkey = document.getElementById("sevkey");
+const present = [...new Set(REGIONS.map(r => r.severity))];
+(LUT.names || present).filter(s => present.includes(s)).forEach(sev => {
+  const span = document.createElement("span"); span.className = "k";
+  span.innerHTML = `<span class="swatch" style="background:${colorFor(sev)}"></span>${sev}`;
+  sevkey.append(span);
+});
+if (!present.length) sevkey.innerHTML = '<span class="k">—</span>';
+
+document.getElementById("opacity").oninput = (e) => { opacity = e.target.value / 100; draw(); };
+document.getElementById("toggleAll").onclick = () => {
+  const target = visible.some(v => !v);
+  REGIONS.forEach((_, i) => visible[i] = target);
+  legend.querySelectorAll("input").forEach((cb, i) => cb.checked = visible[i]);
+  draw();
+};
+if (!document.getElementById("impression").textContent.trim()) {
+  document.getElementById("impression").innerHTML = '<span class="empty">No impression provided.</span>';
+}
+
+draw();
+</script>
+</body>
+</html>

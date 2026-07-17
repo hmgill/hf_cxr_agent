@@ -1,0 +1,17 @@
+# CXR Orchestrator — Hugging Face Docker Space
+# Web UI (Chainlit chat frontend)
+chainlit>=2.0
+# Core agent — >=0.17 brings the agents.sandbox module (SandboxAgent,
+# UnixLocalSandboxClient, Manifest) used by the cxr-overlay sandbox skill, plus
+# the LiteLLM extension that drives Claude.
+openai-agents[litellm]>=0.17
+# Claude (triage calls go through the Anthropic SDK directly)
+anthropic>=0.45.0
+# Data modelling
+pydantic>=2.7.0
+# Local image preprocessing (host-side, no GPU)
+pillow>=10.0.0
+# Async utilities (thread offload for the blocking TTS call)
+anyio>=4.0.0
+# Voice — ElevenLabs TTS for spoken summaries (a free API key works).
+elevenlabs>=1.0.0

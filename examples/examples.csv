@@ -1,0 +1,5 @@
+id,title,image,prompt,source
+example1,Example 1,examples/example1.jpg,"Interpret this chest X-ray and describe any pleural or basilar findings, including their side and location.",https://prod-images-static.radiopaedia.org/images/5494717/2eca6d672a72000d74ba59f782ba80_big_gallery.jpg
+example2,Example 2,examples/example2.png,"Assess this chest X-ray: is it technically adequate, and are the heart size and lung fields within normal limits?",
+example3,Example 3,examples/example3.jpeg,"Describe the pattern and distribution of any airspace opacities across both lungs, then give a brief impression.",
+example4,Example 4,examples/example4.jpeg, "Describe any devices found in this chest X-ray",
