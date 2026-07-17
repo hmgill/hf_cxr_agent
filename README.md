@@ -1,6 +1,6 @@
 # hf_cxr_agent
 
-An agentic chest X-ray (CXR) analysis pipeline. A Claude orchestrator (built on
+Chest X-Ray (CXR) Agent | https://huggingface.co/spaces/hmgill/CXR-Agent. A Claude orchestrator (built on
 the OpenAI Agents SDK) runs the workflow and delegates the vision work to
 specialized models served over FastMCP: triage an image, reason over findings,
 summarize them, localize them, and optionally render an overlay or read the
